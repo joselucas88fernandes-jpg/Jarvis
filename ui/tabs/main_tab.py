@@ -139,14 +139,24 @@ class HudCanvas(QWidget):
             r = r_face * (1.8 - i * 0.08)
             frc = 1.0 - i / 10
             a = max(0, min(255, int(self._halo * 0.085 * frc)))
-            col = qcol(C.MUTED_C if self.muted else C.PRI, a)
+            if self.muted:
+                col = qcol(C.MUTED_C, a)
+            elif self.state == "RECORDING":
+                col = qcol(C.ACC, a)
+            else:
+                col = qcol(C.PRI, a)
             p.setPen(QPen(col, 1.5))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
 
         for pr in self._pulses:
             a = max(0, int(230 * (1.0 - pr / (fw * 0.74))))
-            col = qcol(C.MUTED_C if self.muted else C.PRI, a)
+            if self.muted:
+                col = qcol(C.MUTED_C, a)
+            elif self.state == "RECORDING":
+                col = qcol(C.ACC, a)
+            else:
+                col = qcol(C.PRI, a)
             p.setPen(QPen(col, 1.5))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QRectF(cx - pr, cy - pr, pr * 2, pr * 2))
@@ -157,7 +167,12 @@ class HudCanvas(QWidget):
             ring_r = fw * r_frac
             base = self._rings[idx]
             a_val = max(0, min(255, int(self._halo * (1.0 - idx * 0.18))))
-            col = qcol(C.MUTED_C if self.muted else C.PRI, a_val)
+            if self.muted:
+                col = qcol(C.MUTED_C, a_val)
+            elif self.state == "RECORDING":
+                col = qcol(C.ACC, a_val)
+            else:
+                col = qcol(C.PRI, a_val)
             p.setPen(QPen(col, w_r))
             p.setBrush(Qt.BrushStyle.NoBrush)
             angle = base
@@ -169,7 +184,13 @@ class HudCanvas(QWidget):
         sr = fw * 0.50
         sa = min(255, int(self._halo * 1.5))
         ex = 75 if self.speaking else 44
-        p.setPen(QPen(qcol(C.MUTED_C if self.muted else C.PRI, sa), 2.5))
+        if self.muted:
+            scan_col = qcol(C.MUTED_C, sa)
+        elif self.state == "RECORDING":
+            scan_col = qcol(C.ACC, sa)
+        else:
+            scan_col = qcol(C.PRI, sa)
+        p.setPen(QPen(scan_col, 2.5))
         p.setBrush(Qt.BrushStyle.NoBrush)
         srect = QRectF(cx - sr, cy - sr, sr * 2, sr * 2)
         p.drawArc(srect, int(self._scan * 16), int(ex * 16))
@@ -244,6 +265,9 @@ class HudCanvas(QWidget):
         elif self.state == "LISTENING":
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  LISTENING", qcol(C.GREEN)
+        elif self.state == "RECORDING":
+            sym = "●" if self._blink else "○"
+            txt, col = f"{sym}  RECORDING", qcol(C.ACC)
         else:
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  {self.state}", qcol(C.PRI)
