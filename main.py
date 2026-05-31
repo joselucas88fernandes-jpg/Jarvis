@@ -6,6 +6,7 @@ import threading
 import json
 import sys
 import traceback
+import time
 from pathlib import Path
 
 import sounddevice as sd
@@ -13,6 +14,8 @@ import numpy as np
 from google import genai
 from google.genai import types
 from ui import JarvisUI
+from core.audio_handler import AudioHandler
+
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
 )
@@ -45,11 +48,7 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
-CHANNELS            = 1
-SEND_SAMPLE_RATE    = 16000
-RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE          = 1024
+MODEL_ID        = "gemini-2.0-flash"
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -65,13 +64,6 @@ def _load_system_prompt() -> str:
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
-
-_CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
-
-def _clean_transcript(text: str) -> str:    
-    text = _CTRL_RE.sub("", text)
-    text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
-    return text.strip()
 
 TOOL_DECLARATIONS = [
     {
@@ -483,91 +475,70 @@ TOOL_DECLARATIONS = [
     },
 ]
 
-class JarvisLive:
-
+class JarvisAssistant:
     def __init__(self, ui: JarvisUI):
-        self.ui             = ui
-        self.session        = None
-        self.audio_in_queue = None
-        self.out_queue      = None
-        self._loop          = None
-        self._is_speaking   = False
-        self._speaking_lock = threading.Lock()
+        self.ui = ui
+        self.client = genai.Client(api_key=_get_api_key(), http_options={"api_version": "v1beta"})
+        self.chat = self.client.chats.create(model=MODEL_ID)
+        self.loop = asyncio.new_event_loop()
+
+        self.audio_handler = AudioHandler(model_size="base", compute_type="int8")
+        self.audio_handler.on_recording_start = self._on_recording_start
+        self.audio_handler.on_recording_stop = self._on_recording_stop
+        self.audio_handler.on_transcription_ready = self._on_transcription_ready
+
         self.ui.on_text_command = self._on_text_command
-        self._turn_done_event: asyncio.Event | None = None
+        self._is_speaking = False
+        self._speaking_lock = threading.Lock()
 
-    def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+        threading.Thread(target=self._run_event_loop, daemon=True).start()
+        threading.Thread(target=self.audio_handler.load_model, daemon=True).start()
 
-    def set_speaking(self, value: bool):
-        with self._speaking_lock:
-            self._is_speaking = value
-        if value:
-            self.ui.set_state("SPEAKING")
-        elif not self.ui.muted:
+    def _run_event_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def _on_recording_start(self):
+        self.ui.set_state("RECORDING")
+
+    def _on_recording_stop(self):
+        self.ui.set_state("THINKING")
+
+    def _on_transcription_ready(self, text):
+        if not text:
             self.ui.set_state("LISTENING")
+            return
+        self.ui.write_log(f"You: {text}")
+        asyncio.run_coroutine_threadsafe(self._process_interaction(text), self.loop)
+
+    def _on_text_command(self, text):
+        self.ui.write_log(f"You: {text}")
+        asyncio.run_coroutine_threadsafe(self._process_interaction(text), self.loop)
 
     def speak(self, text: str):
-        if not self._loop or not self.session:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+        self.ui.write_log(f"Jarvis: {text}")
+        asyncio.run_coroutine_threadsafe(self._process_interaction(text, silent_input=True), self.loop)
 
-    def speak_error(self, tool_name: str, error: str):
-        short = str(error)[:120]
-        self.ui.write_log(f"ERR: {tool_name} — {short}")
-        self.speak(f"Sir, {tool_name} encountered an error. {short}")
-
-    def _build_config(self) -> types.LiveConnectConfig:
+    def _get_config(self) -> types.GenerateContentConfig:
         from datetime import datetime
-
-        memory     = load_memory()
-        mem_str    = format_memory_for_prompt(memory)
+        memory = load_memory()
+        mem_str = format_memory_for_prompt(memory)
         sys_prompt = _load_system_prompt()
 
-        now      = datetime.now()
+        now = datetime.now()
         time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
-        time_ctx = (
-            f"[CURRENT DATE & TIME]\n"
-            f"Right now it is: {time_str}\n"
+        context = (
+            f"[CURRENT DATE & TIME]\nRight now it is: {time_str}\n"
             f"Use this to calculate exact times for reminders.\n\n"
+            f"[LANGUAGE]\nThe user is speaking in Portuguese. Always respond in Portuguese.\n\n"
+            f"{mem_str}\n"
+            f"{sys_prompt}"
         )
 
-        parts = []
-
-        # Direcionamento fonético explícito em Português do Brasil para o Gemini Live
-        lang_prime = (
-            "[LANGUAGE & AUDIO TRANSLATION]\n"
-            "The user is speaking in Portuguese (Português do Brasil).\n"
-            "You MUST accurately listen to, understand, and transcribe the Portuguese speech input.\n"
-            "Always respond in Portuguese.\n\n"
-        )
-        parts.append(lang_prime)
-        parts.append(time_ctx)
-        if mem_str:
-            parts.append(mem_str)
-        parts.append(sys_prompt)
-
-        return types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            output_audio_transcription={},
-            input_audio_transcription={},
-            system_instruction="\n".join(parts),
+        return types.GenerateContentConfig(
+            system_instruction=context,
             tools=[{"function_declarations": TOOL_DECLARATIONS}],
-            session_resumption=types.SessionResumptionConfig(),
+            response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -577,11 +548,69 @@ class JarvisLive:
             ),
         )
 
+    async def _process_interaction(self, text, silent_input=False):
+        if not silent_input:
+            self.ui.set_state("THINKING")
+        try:
+            config = self._get_config()
+            response = await asyncio.to_thread(self.chat.send_message, text, config=config)
+
+            while response.candidates[0].content.parts and any(p.function_call for p in response.candidates[0].content.parts):
+                function_calls = [p.function_call for p in response.candidates[0].content.parts if p.function_call]
+                tool_responses = []
+                for fc in function_calls:
+                    res = await self._execute_tool(fc)
+                    tool_responses.append(types.Part.from_function_response(
+                        name=fc.name,
+                        response=res.response
+                    ))
+
+                response = await asyncio.to_thread(self.chat.send_message, tool_responses, config=config)
+
+            full_text = ""
+            audio_data = None
+            for part in response.candidates[0].content.parts:
+                if part.text:
+                    full_text += part.text
+                if part.inline_data:
+                    audio_data = part.inline_data.data
+
+            if full_text and not silent_input:
+                self.ui.write_log(f"Jarvis: {full_text}")
+
+            if audio_data:
+                await self._play_audio_async(audio_data)
+            else:
+                self.ui.set_state("LISTENING")
+
+        except Exception as e:
+            traceback.print_exc()
+            self.ui.set_state("LISTENING")
+
+    async def _play_audio_async(self, audio_bytes):
+        self.ui.set_state("SPEAKING")
+        try:
+            audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
+            # Use run_in_executor to avoid blocking the event loop
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: self._play_audio_blocking(audio_np))
+        except Exception as e:
+            print(f"[JARVIS] ❌ Playback error: {e}")
+        finally:
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+
+    def _play_audio_blocking(self, audio_np):
+        try:
+            sd.play(audio_np, samplerate=24000)
+            sd.wait()
+        except Exception as e:
+            print(f"[JARVIS] ❌ sd.play error: {e}")
+
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
-
-        print(f"[JARVIS] 🔧 {name}  {args}")
+        print(f"[JARVIS] 🔧 Tool Call: {name}({args})")
         self.ui.set_state("THINKING")
 
         if name == "save_memory":
@@ -590,15 +619,9 @@ class JarvisLive:
             value    = args.get("value", "")
             if key and value:
                 update_memory({category: {key: {"value": value}}})
-                print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
-            if not self.ui.muted:
-                self.ui.set_state("LISTENING")
-            return types.FunctionResponse(
-                id=fc.id, name=name,
-                response={"result": "ok", "silent": True}
-            )
+            return types.FunctionResponse(id=fc.id, name=name, response={"result": "ok", "silent": True})
 
-        loop   = asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
         result = "Done."
 
         try:
@@ -631,12 +654,7 @@ class JarvisLive:
                 result = r or "Done."
 
             elif name == "screen_process":
-                threading.Thread(
-                    target=screen_process,
-                    kwargs={"parameters": args, "response": None,
-                            "player": self.ui, "session_memory": None},
-                    daemon=True
-                ).start()
+                threading.Thread(target=screen_process, kwargs={"parameters": args, "response": None, "player": self.ui, "session_memory": None}, daemon=True).start()
                 result = "Vision module activated. Stay completely silent — vision module will speak directly."
 
             elif name == "computer_settings":
@@ -665,13 +683,11 @@ class JarvisLive:
             elif name == "web_search":
                 r = await loop.run_in_executor(None, lambda: web_search_action(parameters=args, player=self.ui))
                 result = r or "Done."
+
             elif name == "file_processor":
                 if not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
-                r = await loop.run_in_executor(
-                    None,
-                    lambda: file_processor(parameters=args, player=self.ui, speak=self.speak)
-                )
+                r = await loop.run_in_executor(None, lambda: file_processor(parameters=args, player=self.ui, speak=self.speak))
                 result = r or "Done."
 
             elif name == "computer_control":
@@ -691,241 +707,26 @@ class JarvisLive:
                 self.speak("Goodbye, sir.")
                 def _shutdown():
                     import time, os
-                    time.sleep(1)
+                    time.sleep(1.5)
                     os._exit(0)
                 threading.Thread(target=_shutdown, daemon=True).start()
-
+                result = "Shutting down."
             else:
                 result = f"Unknown tool: {name}"
-
         except Exception as e:
-            result = f"Tool '{name}' failed: {e}"
+            result = f"Error: {e}"
             traceback.print_exc()
-            self.speak_error(name, e)
 
-        if not self.ui.muted:
-            self.ui.set_state("LISTENING")
-
-        print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
-        return types.FunctionResponse(
-            id=fc.id, name=name,
-            response={"result": result}
-        )
-
-    async def _send_realtime(self):
-        while True:
-            msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
-
-    async def _listen_audio(self):
-        print("[JARVIS] 🎤 Mic started")
-        loop = asyncio.get_event_loop()
-
-        # Configurações do Portão de Ruído (VAD Adaptativo) e Ganho de Áudio
-        state = {
-            "ambient_rms": 150.0,
-            "hangover_counter": 0,
-        }
-        HANGOVER_LIMIT = 12   # ~0.8 segundos de tolerância
-        GAIN_BOOST = 1.8      # Amplificação de 1.8x
-
-        def callback(indata, frames, time_info, status):
-            with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted:
-                # 1. Ganho de volume por software
-                raw_data = indata.astype(np.float32)
-                boosted_data = raw_data * GAIN_BOOST
-                
-                # Calcular o RMS do áudio bruto (sem ganho) para calibrar o ruído real do ambiente
-                current_rms = np.sqrt(np.mean(raw_data ** 2))
-                
-                # Clipping de segurança (evitar estouro de int16) e conversão de volta
-                boosted_data = np.clip(boosted_data, -32768, 32767)
-                out_chunk = boosted_data.astype(np.int16)
-                
-                # 2. Calibração adaptativa lenta do ruído de fundo (silêncio)
-                if current_rms < state["ambient_rms"] * 1.5:
-                    state["ambient_rms"] = state["ambient_rms"] * 0.95 + current_rms * 0.05
-                
-                # Piso mínimo de segurança para evitar ruído nulo
-                state["ambient_rms"] = max(10.0, state["ambient_rms"])
-
-                # 3. Limiar dinâmico para ativação por voz (1.6x ruído ambiente ou mínimo de 200)
-                threshold = max(200.0, state["ambient_rms"] * 1.6)
-                
-                # 4. Decisão de Atividade de Voz e Hangover
-                if current_rms > threshold:
-                    state["hangover_counter"] = HANGOVER_LIMIT
-                    is_active = True
-                else:
-                    if state["hangover_counter"] > 0:
-                        state["hangover_counter"] -= 1
-                        is_active = True
-                    else:
-                        is_active = False
-
-                # 5. Enviar apenas se houver voz ativa
-                if is_active:
-                    data = out_chunk.tobytes()
-                    loop.call_soon_threadsafe(
-                        self.out_queue.put_nowait,
-                        {"data": data, "mime_type": "audio/pcm"}
-                    )
-
-        try:
-            with sd.InputStream(
-                samplerate=SEND_SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="int16",
-                blocksize=CHUNK_SIZE,
-                callback=callback,
-            ):
-                print("[JARVIS] 🎤 Mic stream open")
-                while True:
-                    await asyncio.sleep(0.1)
-        except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
-            raise
-
-    async def _receive_audio(self):
-        print("[JARVIS] 👂 Recv started")
-        out_buf, in_buf = [], []
-
-        try:
-            while True:
-                async for response in self.session.receive():
-
-                    if response.data:
-                        if self._turn_done_event and self._turn_done_event.is_set():
-                            self._turn_done_event.clear()
-                        self.audio_in_queue.put_nowait(response.data)
-
-                    if response.server_content:
-                        sc = response.server_content
-
-                        if sc.output_transcription and sc.output_transcription.text:
-                            txt = _clean_transcript(sc.output_transcription.text)
-                            if txt:
-                                out_buf.append(txt)
-
-                        if sc.input_transcription and sc.input_transcription.text:
-                            txt = _clean_transcript(sc.input_transcription.text)
-                            if txt:
-                                in_buf.append(txt)
-
-                        if sc.turn_complete:
-                            if self._turn_done_event:
-                                self._turn_done_event.set()
-
-                            full_in = " ".join(in_buf).strip()
-                            if full_in:
-                                self.ui.write_log(f"You: {full_in}")
-                            in_buf = []
-
-                            full_out = " ".join(out_buf).strip()
-                            if full_out:
-                                self.ui.write_log(f"Jarvis: {full_out}")
-                            out_buf = []
-
-                    if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
-                        )
-        except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
-            traceback.print_exc()
-            raise
-
-    async def _play_audio(self):
-        print("[JARVIS] 🔊 Play started")
-
-        stream = sd.RawOutputStream(
-            samplerate=RECEIVE_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-        )
-        stream.start()
-
-        try:
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        self.audio_in_queue.get(),
-                        timeout=0.1
-                    )
-                except asyncio.TimeoutError:
-                    if (
-                        self._turn_done_event
-                        and self._turn_done_event.is_set()
-                        and self.audio_in_queue.empty()
-                    ):
-                        self.set_speaking(False)
-                        self._turn_done_event.clear()
-                    continue
-                self.set_speaking(True)
-                await asyncio.to_thread(stream.write, chunk)
-        except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
-            raise
-        finally:
-            self.set_speaking(False)
-            stream.stop()
-            stream.close()
-
-    async def run(self):
-        client = genai.Client(
-            api_key=_get_api_key(),
-            http_options={"api_version": "v1beta"}
-        )
-
-        while True:
-            try:
-                print("[JARVIS] 🔌 Connecting...")
-                self.ui.set_state("THINKING")
-                config = self._build_config()
-
-                async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
-                    async with asyncio.TaskGroup() as tg:
-                        self.session        = session
-                        self._loop          = asyncio.get_event_loop()
-                        self.audio_in_queue = asyncio.Queue()
-                        self.out_queue      = asyncio.Queue(maxsize=10)
-                        self._turn_done_event = asyncio.Event()
-
-                        print("[JARVIS] ✅ Connected.")
-                        self.ui.set_state("LISTENING")
-                        self.ui.write_log("SYS: JARVIS online.")
-
-                        tg.create_task(self._send_realtime())
-                        tg.create_task(self._listen_audio())
-                        tg.create_task(self._receive_audio())
-                        tg.create_task(self._play_audio())
-
-            except Exception as e:
-                print(f"[JARVIS] ⚠️ {e}")
-                traceback.print_exc()
-            self.set_speaking(False)
-            self.ui.set_state("THINKING")
-            print("[JARVIS] 🔄 Reconnecting in 3s...")
-            await asyncio.sleep(3)
+        return types.FunctionResponse(id=fc.id, name=name, response={"result": result})
 
 def main():
     ui = JarvisUI("face.png")
 
     def runner():
         ui.wait_for_api_key()
-        jarvis = JarvisLive(ui)
-        try:
-            asyncio.run(jarvis.run())
-        except KeyboardInterrupt:
-            print("\n🔴 Shutting down...")
+        assistant = JarvisAssistant(ui)
+        assistant.audio_handler.start_ptt_listener()
+        print("[JARVIS] ✅ System ready. Hold CTRL+SHIFT to speak.")
 
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()

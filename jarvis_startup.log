@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/app/main.py", line 12, in <module>
+    import sounddevice as sd
+  File "/home/jules/.pyenv/versions/3.12.13/lib/python3.12/site-packages/sounddevice.py", line 72, in <module>
+    raise OSError('PortAudio library not found')
+OSError: PortAudio library not found
